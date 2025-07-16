@@ -1,156 +1,183 @@
 #!/usr/bin/env python3
+from dataclasses import asdict, dataclass, field
+import logging
+from pathlib import Path
 import os
 import sys
 import shutil
 import signal
 import subprocess
+from subprocess import SubprocessError
 import time
-from typing import List, Tuple, TypedDict
+from typing import List
+import yaml
 
-# --- Configuration ---
-class Config(TypedDict):
-  debug: bool
-  tmp_dir: str
-  cmd_bitwarden: str
-  cmd_clipboard_copy: List[str]
-  cmd_clipboard_clear: List[str]
-  cmd_clipboard_mode: Tuple[str, str] # first is clipboard, second is primary
-  clear_timeout: int # seconds
+@dataclass
+class Config:
+  debug: bool = False
+  transient_dir: str = os.getenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+  bw_cmd: str = "bw"
+  clipboard_copy_cmd: List[str] = field(default_factory=lambda: [])
+  clipboard_clear_cmd: List[str] = field(default_factory=lambda: [])
+  clipboard_clear_timeout: int = 30 # seconds
 
-config: Config = {
-  "debug": False,
-  "tmp_dir": f"/run/user/{os.getuid()}",
-  "cmd_bitwarden": "bw",
-  "cmd_clipboard_copy": ["xsel", "--input"],
-  "cmd_clipboard_clear": ["xsel", "--clear"],
-  "cmd_clipboard_mode": ("--clipboard", "--primary"),
-  "clear_timeout": 30,
-}
+  CFG_PATHS = (
+    Path("/etc/bwx.yml"),
+    Path("/etc/bwx.yaml"),
+    Path.home() / ".config" / "bwx.yml",
+    Path.home() / ".config" / "bwx.yaml",
+    Path(__file__).parent / "bwx.yml",
+    Path(__file__).parent / "bwx.yaml",
+  )
 
-# --- Main Function ---
-def main() -> None:
-  pre_checks()
-  cmd_bw = config["cmd_bitwarden"]
-  config["debug"] = "--debug" in sys.argv and sys.argv.remove("--debug") is None
-  primary = "--primary" in sys.argv and sys.argv.remove("--primary") is None
-  if len(sys.argv) < 2:
-    os.execvp(cmd_bw, [cmd_bw, "--help"])
-  cmd, *args = sys.argv[1:]
-  log(f"command: '{cmd}', Args: {args}")
-  if not cmd in ("login", "logout"):
-    unlock()
-  if cmd == "unlock":
-    sys.exit(0)
-  elif cmd in ("cp", "copy"):
-    copy(item=" ".join(args), primary=primary)
-    sys.exit(0)
-  else:
-    log(f"passing command to '{cmd_bw}'...")
-    base_cmd = [cmd_bw, cmd] if cmd != "pw" else [cmd_bw, "get", "password"]
-    os.execvp(cmd_bw, base_cmd + args)
+  @classmethod
+  def from_yaml(cls) -> "Config":
+    cfg = asdict(cls())
+    for file in cls.CFG_PATHS:
+      if not file.is_file(): continue
+      cfg.update(yaml.safe_load(file.read_text()) or {})
+    return cls(**cfg).validate()
 
-def pre_checks() -> None:
-  if not shutil.which(config["cmd_bitwarden"]):
-    sys.exit(f"Error: {config["cmd_bitwarden"]} command not found")
-  tmp_dir = config["tmp_dir"]
-  if not os.path.isdir(tmp_dir):
-    sys.exit(f"Error: Temporary directory {tmp_dir} does not exist")
-  if not os.access(tmp_dir, os.W_OK):
-    sys.exit(f"Error: No write permission for temporary directory {tmp_dir}")
+  def get_transient_path(self) -> Path:
+    dir = os.path.expandvars(self.transient_dir)
+    dir = os.path.expanduser(dir)
+    return Path(dir)
+  
+  def is_copy_enabled(self) -> bool: return bool(self.clipboard_copy_cmd)
 
-# --- Session Management ---
-SESSION_ENV = "BW_SESSION"
+  def is_clear_enabled(self) -> bool: return bool(self.clipboard_clear_cmd)
+  
+  def validate(self) -> "Config":
+    if not self.transient_dir:
+      raise ValueError("transient directory not set")
+    self.get_transient_path().mkdir(exist_ok=True, mode=0o700)
+    if not shutil.which(self.bw_cmd):
+      raise ValueError(f"command '{self.bw_cmd}' not found")
+    if self.is_copy_enabled() and not shutil.which(self.clipboard_copy_cmd[0]):
+      raise ValueError(f"command '{self.clipboard_copy_cmd[0]}' not found")
+    if self.is_clear_enabled() and not shutil.which(self.clipboard_clear_cmd[0]):
+      raise ValueError(f"command '{self.clipboard_clear_cmd[0]}' not found")
+    if self.is_clear_enabled() and self.clipboard_clear_timeout <= 0:
+      raise ValueError("clipboard clear timeout must be positive")
+    return self
 
-def unlock() -> None:
-  log("unlocking vault...")
-  token = os.getenv(SESSION_ENV)
-  if token: return token
-  session_file = os.path.join(config["tmp_dir"], SESSION_ENV)
-  token = load_session(session_file)
-  if not token: 
-    log("no active session. Unlocking vault...")
-    try: token = subprocess.check_output([config["cmd_bitwarden"], "unlock", "--raw"], text=True).strip()
-    except subprocess.CalledProcessError: sys.exit(1)
-    if not token: sys.exit("Error: No session token found")
-    save_session(session_file, token)
-  os.environ[SESSION_ENV] = token
+class Session:
+  SESSION_ENV = "BW_SESSION"
+  def __init__(self, cfg: Config):
+    self.cfg = cfg
+    self.session_file = self.cfg.get_transient_path() / self.SESSION_ENV
 
-def load_session(session_file: str) -> str:
-  if os.path.isfile(session_file):
-    log(f"loading session from file")
-    with open(session_file) as file:
-      return file.read().strip()
-  return ""
+  def unlock(self) -> str:
+    token = os.getenv(self.SESSION_ENV)
+    if token: return token    
+    token = self._load_session()
+    if not token: 
+      logger.debug("unlocking vault...")
+      token = subprocess.check_output([self.cfg.bw_cmd, "unlock", "--raw"], text=True).strip()
+      if not token: raise ValueError("no session token received")
+      self._save_session(token)
+    os.environ[self.SESSION_ENV] = token
+    return token
 
-def save_session(session_file: str, token: str) -> None:
-  log(f"saving new session token to {session_file}")
-  fd = os.open(session_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-  try:
-    os.write(fd, token.encode())
-  finally:
-    os.close(fd)
+  def _load_session(self) -> str:
+    if self.session_file.is_file():
+      logger.debug(f"loading session from {self.session_file}")
+      return self.session_file.read_text()
+    return ""
 
-# --- Copy Command ---
-def copy(item: str, primary: bool = False) -> None:
-  cmd = config["cmd_clipboard_copy"] + [config["cmd_clipboard_mode"][primary]]
-  if not shutil.which(cmd[0]):
-    sys.exit(f"Error: {cmd[0]} command not found")
-  log(f"copy for: '{item}'")
-  try: pw = subprocess.check_output([config["cmd_bitwarden"], "get", "password", item], text=True).strip()
-  except subprocess.CalledProcessError: return
-  log(f"pw retrieved, copying to {"primary" if primary else "clipboard"}...")
-  copy_process = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
-  pid_file = os.path.join(config["tmp_dir"], "bw_clear.pid")
-  copy_clear_cancel(pid_file)
-  copy_process.communicate(pw)
-  log(f"copy done")
-  copy_clear_fork(pid_file, primary)
+  def _save_session(self, token: str) -> None:
+    logger.debug(f"saving new session token to {self.session_file}")
+    self.session_file.touch(mode=0o600, exist_ok=True)
+    self.session_file.write_text(token)
 
-def copy_clear_fork(pid_file: str, primary: bool = False) -> None:
-  cmd = config["cmd_clipboard_clear"] + [config["cmd_clipboard_mode"][primary]]
-  if not shutil.which(cmd[0]):
-    sys.exit(f"Error: {cmd[0]} command not found")
-  if os.fork() != 0: return # parent exits
-  pid = os.getpid()
-  log(f"[{pid}] forked")
-  if not config["debug"]: os.setsid() # detach from tty/signals
-  signal.signal(signal.SIGTERM, lambda signum, frame: copy_clear_cleanup(pid_file, signum))
-  try:
-    with open(pid_file, 'w') as file:
-      file.write(str(pid))
-    log(f"[{pid}] sleeping for {config["clear_timeout"]}s")
-    time.sleep(config["clear_timeout"])
-    log(f"[{pid}] clearing clipboard")
-    subprocess.run(cmd)
-  finally:
-    copy_clear_cleanup(pid_file)
-    os._exit(0)
+class CopyCommand:
+  PID_FILE_NAME = "bw_clear.pid"
+  def __init__(self, cfg: Config):
+    self.cfg = cfg
+    self.pid_file = self.cfg.get_transient_path() / self.PID_FILE_NAME
 
-def copy_clear_cancel(pid_file: str) -> None:
-  if not os.path.isfile(pid_file): return
-  with open(pid_file) as file:
-    pid = int(file.read().strip())
+  def execute(self, item: str) -> None:
+    if not self.cfg.is_copy_enabled():
+      raise ValueError("clipboard copy command not configured")
+    logger.debug(f"copy for: '{item}'")
+    try: pw = subprocess.check_output([self.cfg.bw_cmd, "get", "password", item], text=True).strip()
+    except SubprocessError: return # bw_cmd prints error message
+    logger.debug(f"copying to clipboard...")
+    copy_process = subprocess.Popen(self.cfg.clipboard_copy_cmd, stdin=subprocess.PIPE, text=True)
+    self._copy_clear_cancel()
+    copy_process.communicate(pw)
+    logger.debug(f"copy done")
+    self._copy_clear_fork()
+
+  def _copy_clear_fork(self) -> None:
+    if not self.cfg.is_clear_enabled():
+      logger.debug("copy clear not enabled, skipping")
+      return
+    if os.fork() != 0: return # parent exits
+    pid = os.getpid()
+    logger.debug(f"{pid}:forked")
+    if not self.cfg.debug: os.setsid() # detach from tty/signals
+    signal.signal(signal.SIGTERM, lambda signum, frame: self._copy_clear_cleanup(signum))
+    try:
+      self.pid_file.write_text(str(pid))
+      logger.debug(f"{pid}:sleeping for {self.cfg.clipboard_clear_timeout}s")
+      time.sleep(self.cfg.clipboard_clear_timeout)
+      logger.debug(f"{pid}:clearing clipboard")
+      subprocess.run(self.cfg.clipboard_clear_cmd)
+    finally:
+      self._copy_clear_cleanup()
+      os._exit(0)
+
+  def _copy_clear_cancel(self) -> None:
+    if not self.pid_file.is_file(): return
+    pid = int(self.pid_file.read_text())
     try:
       os.kill(pid, signal.SIGTERM)
-      log(f"sent SIGTERM to existing process {pid}")
+      logger.debug(f"sent SIGTERM to existing process {pid}")
     except ProcessLookupError:
-      log(f"process {pid} not found, likely already gone")
+      logger.debug(f"process {pid} not found, likely already gone")
       pass
 
-def copy_clear_cleanup(pid_file: str, signum=None) -> None:
-  if signum is not None:
-    log(f"[{os.getpid()}] received cleanup signal {signum}")
-  try:
-    os.remove(pid_file)
-    log(f"[{os.getpid()}] removed its PID file")
-  except OSError: pass
-  if signum is not None:
-    os._exit(0)
+  def _copy_clear_cleanup(self, signum=None) -> None:
+    if signum is not None:
+      logger.debug(f"{os.getpid()}:received cleanup signal {signum}")
+    self.pid_file.unlink(missing_ok=True)
+    logger.debug(f"{os.getpid()}:removed its PID file")
+    if signum is not None:
+      os._exit(0)
 
-# --- Logging ---
-def log(message: str) -> None:
-  if config["debug"]: print(f"DEBUG: {message}", file=sys.stderr)
+class Bwx:
+  def __init__(self, cfg: Config):
+    self.cfg = cfg
 
-# --- Main Execution ---
+  def run(self) -> int:
+    if len(sys.argv) < 2:
+      os.execvp(self.cfg.bw_cmd, [self.cfg.bw_cmd, "--help"])
+    cmd, *args = sys.argv[1:]
+    logger.debug(f"command: '{cmd}', Args: {args}")
+    if not cmd in ("login", "logout", "config"):
+      session = Session(self.cfg)
+      session.unlock()
+    if cmd == "unlock":
+      return 0;
+    elif cmd in ("cp", "copy"):
+      copy = CopyCommand(self.cfg)
+      copy.execute(" ".join(args))
+      return 0
+    else:
+      logger.debug(f"passing command to '{self.cfg.bw_cmd}'...")
+      base_cmd = [self.cfg.bw_cmd, cmd] if cmd != "pw" else [self.cfg.bw_cmd, "get", "password"]
+      os.execvp(self.cfg.bw_cmd, base_cmd + args)
+
 if __name__ == "__main__":
-  main()
+  logging.basicConfig(stream=sys.stderr, level=logging.WARN)
+  logger = logging.getLogger("bwx")
+  try: 
+    config = Config.from_yaml()
+    if config.debug: logger.setLevel(logging.DEBUG)
+    bwx = Bwx(config)
+    status = bwx.run()
+    sys.exit(status)
+  except (yaml.YAMLError, ValueError, OSError, SubprocessError) as e:
+    logger.error(e)
+    sys.exit(1)
