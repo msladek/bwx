@@ -90,6 +90,12 @@ class Session:
     self.session_file.touch(mode=0o600, exist_ok=True)
     self.session_file.write_text(token)
 
+  def clear(self) -> None:
+    logger.debug("clearing session")
+    os.environ.pop(self.SESSION_ENV, None)
+    if self.session_file.is_file():
+      self.session_file.unlink(missing_ok=True)
+
 class CopyCommand:
   PID_FILE_NAME = "bw_clear.pid"
   def __init__(self, cfg: Config):
@@ -155,9 +161,10 @@ class Bwx:
       os.execvp(self.cfg.bw_cmd, [self.cfg.bw_cmd, "--help"])
     cmd, *args = sys.argv[1:]
     logger.debug(f"command: '{cmd}', Args: {args}")
-    if not cmd in ("login", "logout", "config"):
-      session = Session(self.cfg)
-      session.unlock()
+    if cmd in ("lock", "logout"):
+      Session(self.cfg).clear()
+    elif not cmd in ("login", "config"):
+      Session(self.cfg).unlock()
     if cmd == "unlock":
       return 0;
     elif cmd in ("cp", "copy"):

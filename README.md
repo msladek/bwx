@@ -4,7 +4,7 @@ A lightweight python wrapper for the Bitwarden CLI.
 
 ## Features
 
-- **Session management**: Unlock your Bitwarden vault once per session and cache the session token securely.
+- **Session management**: Unlock your Bitwarden vault once and cache the session token securely.
 - **`cp`/`copy` subcommand**: Copy a password to the clipboard.
 - **Auto‑clear**: Automatically clears the clipboard after a configurable timeout.
 - **YAML config**: Easy configuration using a YAML file.
@@ -21,7 +21,7 @@ A lightweight python wrapper for the Bitwarden CLI.
    ```bash
    wget https://raw.githubusercontent.com/msladek/bwx/refs/heads/main/bwx.py
    chmod +x bwx
-   cp bwx.py ~/bin/bwx
+   mv bwx.py ~/bin/bwx
    ```
 2. Create a config fitting your needs, see `Configuration` section below:
    ```bash
@@ -40,6 +40,12 @@ See [Bitwarden CLI documentation](https://bitwarden.com/help/cli/) for available
 ```bash
 bwx cp <item>
 ```
+
+### Aliases
+
+| Alias | Command |
+|-------|------------------------------------|
+| `bwx pw <item>` | `bw get password <item>` |
 
 ## Configuration
 
