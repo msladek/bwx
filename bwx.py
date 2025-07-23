@@ -61,6 +61,25 @@ class Config:
       raise ValueError("clipboard clear timeout must be positive")
     return self
 
+class CliInput:
+  def __init__(self):
+    self.global_flags = []
+    self.cmd = "help"
+    self.cmd_input = []
+  
+  def parse(self, argv: List[str]) -> None:
+    for i, arg in enumerate(argv):
+      if arg.startswith('-'):
+        self.global_flags.append(arg)
+      else:
+        self.cmd = arg
+        self.cmd_input = argv[i+1:]
+        break
+    logger.debug(f"parsed {self}")
+
+  def __str__(self) -> str:
+    return f"CliInput(cmd={self.cmd}, global_flags={self.global_flags}, cmd_input={self.cmd_input})"
+
 class Session:
   SESSION_ENV = "BW_SESSION"
   def __init__(self, cfg: Config):
@@ -153,28 +172,29 @@ class CopyCommand:
       os._exit(0)
 
 class Bwx:
-  def __init__(self, cfg: Config):
+  def __init__(self, cfg: Config, cli_input: CliInput):
     self.cfg = cfg
+    self.cli_input = cli_input
 
   def run(self) -> int:
-    if len(sys.argv) < 2:
-      os.execvp(self.cfg.bw_cmd, [self.cfg.bw_cmd, "--help"])
-    cmd, *args = sys.argv[1:]
-    logger.debug(f"command: '{cmd}', Args: {args}")
+    cmd = self.cli_input.cmd
     if cmd in ("lock", "logout"):
       Session(self.cfg).clear()
-    elif not cmd in ("login", "config"):
+    elif not cmd in ("login", "config", "help"):
       Session(self.cfg).unlock()
     if cmd == "unlock":
       return 0;
     elif cmd in ("cp", "copy"):
       copy = CopyCommand(self.cfg)
-      copy.execute(" ".join(args))
+      copy.execute(" ".join(self.cli_input.cmd_input))
       return 0
     else:
-      logger.debug(f"passing command to '{self.cfg.bw_cmd}'...")
-      base_cmd = [self.cfg.bw_cmd, cmd] if cmd != "pw" else [self.cfg.bw_cmd, "get", "password"]
-      os.execvp(self.cfg.bw_cmd, base_cmd + args)
+      fw_cmd = [self.cfg.bw_cmd] + self.cli_input.global_flags
+      if cmd == "pw": fw_cmd += ["get", "password"]
+      else: fw_cmd += [cmd]
+      fw_cmd += self.cli_input.cmd_input
+      logger.debug(f"passing command to '{fw_cmd}'")
+      os.execvp(self.cfg.bw_cmd, fw_cmd)
 
 if __name__ == "__main__":
   logging.basicConfig(stream=sys.stderr, level=logging.WARN)
@@ -182,7 +202,9 @@ if __name__ == "__main__":
   try: 
     config = Config.from_yaml()
     if config.debug: logger.setLevel(logging.DEBUG)
-    bwx = Bwx(config)
+    cli_input = CliInput()
+    cli_input.parse(sys.argv[1:])
+    bwx = Bwx(config, cli_input)
     status = bwx.run()
     sys.exit(status)
   except (yaml.YAMLError, ValueError, OSError, SubprocessError) as e:
